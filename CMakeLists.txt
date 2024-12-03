@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(_src_dir "${CMAKE_CURRENT_SOURCE_DIR}/dx11")
 file(GLOB _source_list "${_src_dir}/*.cpp" "${_src_dir}/*.hpp")
 set(_target "dx11")
-add_executable(${_target} ${_source_list})
+add_executable(${_target} WIN32 ${_source_list})
 target_link_libraries(${_target}
     PUBLIC
         d3d11
@@ -18,7 +18,7 @@ target_link_libraries(${_target}
 set(_src_dir "${CMAKE_CURRENT_SOURCE_DIR}/dx12")
 file(GLOB _source_list "${_src_dir}/*.cpp" "${_src_dir}/*.hpp")
 set(_target "dx12")
-add_executable(${_target} ${_source_list})
+add_executable(${_target} WIN32 ${_source_list})
 target_link_libraries(${_target}
     PRIVATE
         d12
