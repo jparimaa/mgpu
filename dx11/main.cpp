@@ -121,15 +121,15 @@ void releaseDXPtr(T*& ptr)
     }
 }
 
-IDXGIFactory* createFactory()
+IDXGIFactory1* createFactory()
 {
-    IDXGIFactory* factory = nullptr;
+    IDXGIFactory1* factory = nullptr;
 
-    CHECK_HR(CreateDXGIFactory(__uuidof(IDXGIFactory), (void**)&factory));
+    CHECK_HR(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory));
     return factory;
 }
 
-std::vector<IDXGIAdapter*> getAdapters(IDXGIFactory* factory)
+std::vector<IDXGIAdapter*> getAdapters(IDXGIFactory1* factory)
 {
     UINT i = 0;
     IDXGIAdapter* adapter;
@@ -157,11 +157,54 @@ void printAdapters(std::vector<IDXGIAdapter*>& adapters)
 
 AdapterEnv createAdapterEnv(IDXGIAdapter* adapter)
 {
-    const UINT flags = D3D11_CREATE_DEVICE_DEBUG;
+    const UINT flags =
+#ifdef _DEBUG
+        D3D11_CREATE_DEVICE_DEBUG;
+#else
+        0;
+#endif
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
     CHECK_HR(D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, 0, flags, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context));
     return AdapterEnv{device, context};
+}
+
+ID3D11Texture2D* createTexture(ID3D11Device* device)
+{
+    D3D11_TEXTURE2D_DESC textureDesc{};
+    textureDesc.Width = c_width;
+    textureDesc.Height = c_height;
+    textureDesc.MipLevels = 1;
+    textureDesc.ArraySize = 1;
+    textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.Usage = D3D11_USAGE_DEFAULT;
+    textureDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+    ID3D11Texture2D* texture = nullptr;
+    CHECK_HR(device->CreateTexture2D(&textureDesc, nullptr, &texture));
+
+    return texture;
+}
+
+ID3D11RenderTargetView* createRtv(ID3D11Device* device, ID3D11Texture2D* texture)
+{
+    ID3D11RenderTargetView* rtv = nullptr;
+    CHECK_HR(device->CreateRenderTargetView(texture, nullptr, &rtv));
+    return rtv;
+}
+
+ID3D11Texture2D* createStagingTexture(ID3D11Device* device, ID3D11Texture2D* originalTexture)
+{
+    D3D11_TEXTURE2D_DESC desc{};
+    originalTexture->GetDesc(&desc);
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.BindFlags = 0;
+
+    ID3D11Texture2D* stagingTexture = nullptr;
+    CHECK_HR(device->CreateTexture2D(&desc, nullptr, &stagingTexture));
+    return stagingTexture;
 }
 
 IDXGISwapChain* createSwapChain(HWND hwnd, ID3D11Device* device)
@@ -172,8 +215,8 @@ IDXGISwapChain* createSwapChain(HWND hwnd, ID3D11Device* device)
     IDXGIAdapter* adapter = nullptr;
     CHECK_HR(dxgiDevice->GetAdapter(&adapter));
 
-    IDXGIFactory* factory = nullptr;
-    CHECK_HR(adapter->GetParent(__uuidof(IDXGIFactory), (void**)&factory));
+    IDXGIFactory1* factory = nullptr;
+    CHECK_HR(adapter->GetParent(__uuidof(IDXGIFactory1), (void**)&factory));
 
     DXGI_SWAP_CHAIN_DESC swapChainDesc{};
     swapChainDesc.BufferCount = 1;
@@ -211,10 +254,12 @@ ID3D11RenderTargetView* createWindowRtv(IDXGISwapChain* swapChain, ID3D11Device*
     return rtv;
 }
 
-IDXGIFactory* m_factory = nullptr;
+IDXGIFactory1* m_factory = nullptr;
 AdapterEnv m_adapterEnv0;
 AdapterEnv m_adapterEnv1;
 ID3D11Texture2D* m_texture = nullptr;
+ID3D11RenderTargetView* m_rtv = nullptr;
+ID3D11Texture2D* m_stagingTexture = nullptr;
 IDXGISwapChain* m_swapChain = nullptr;
 ID3D11RenderTargetView* m_windowRtv = nullptr;
 
@@ -231,11 +276,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     m_adapterEnv0 = createAdapterEnv(adapters[0]);
     m_adapterEnv1 = createAdapterEnv(adapters[1]);
 
+    m_texture = createTexture(m_adapterEnv1.device);
+    m_rtv = createRtv(m_adapterEnv1.device, m_texture);
+    m_stagingTexture = createStagingTexture(m_adapterEnv1.device, m_texture);
+
     m_swapChain = createSwapChain(hwnd, m_adapterEnv0.device);
     m_windowRtv = createWindowRtv(m_swapChain, m_adapterEnv0.device);
 
     bool running = true;
     float blue = 0.0f;
+
+    ID3D11Texture2D* backBuffer = nullptr;
+    CHECK_HR(m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer));
+
+    D3D11_VIEWPORT viewport{};
+    viewport.TopLeftX = 0.0f;
+    viewport.TopLeftY = 0.0f;
+    viewport.Width = static_cast<float>(c_width);
+    viewport.Height = static_cast<float>(c_height);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+
     while (running)
     {
         MSG msg = {};
@@ -250,31 +311,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             DispatchMessage(&msg);
         }
 
-        m_adapterEnv0.context->OMSetRenderTargets(1, &m_windowRtv, nullptr);
-
-        D3D11_VIEWPORT viewport{};
-        viewport.TopLeftX = 0.0f;
-        viewport.TopLeftY = 0.0f;
-        viewport.Width = static_cast<float>(c_width);
-        viewport.Height = static_cast<float>(c_height);
-        viewport.MinDepth = 0.0f;
-        viewport.MaxDepth = 1.0f;
-
-        m_adapterEnv0.context->RSSetViewports(1, &viewport);
-        blue += 0.01f;
+        blue = blue > 1.0f ? 0.0f : blue + 0.01f;
         float clearColor[4] = {0.0f, 0.2f, blue, 1.0f};
-        if (blue > 1.0f)
-        {
-            blue = 0.0f;
-        }
-        m_adapterEnv0.context->ClearRenderTargetView(m_windowRtv, clearColor);
 
+        m_adapterEnv1.context->RSSetViewports(1, &viewport);
+        m_adapterEnv1.context->OMSetRenderTargets(1, &m_rtv, nullptr);
+        m_adapterEnv1.context->ClearRenderTargetView(m_rtv, clearColor);
+        m_adapterEnv1.context->CopyResource(m_stagingTexture, m_texture);
+        D3D11_MAPPED_SUBRESOURCE mappedResource;
+        m_adapterEnv1.context->Map(m_stagingTexture, 0, D3D11_MAP_READ, 0, &mappedResource);
+        m_adapterEnv0.context->UpdateSubresource(backBuffer, 0, nullptr, mappedResource.pData, mappedResource.RowPitch, 0);
+        m_adapterEnv1.context->Unmap(m_stagingTexture, 0);
         m_swapChain->Present(1, 0);
     }
 
     releaseDXPtr(m_windowRtv);
     releaseDXPtr(m_swapChain);
-    releaseDXPtr(m_factory);
+    releaseDXPtr(m_stagingTexture);
+    releaseDXPtr(m_rtv);
     releaseDXPtr(m_texture);
     releaseDXPtr(m_adapterEnv0.context);
     releaseDXPtr(m_adapterEnv0.device);
@@ -284,5 +338,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     {
         releaseDXPtr(adapter);
     }
+    releaseDXPtr(m_factory);
     return 0;
 }
