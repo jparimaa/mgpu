@@ -46,13 +46,36 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     }
 }
 
-const int c_width = 800;
-const int c_height = 600;
+template<typename T>
+void releaseDXPtr(T*& ptr)
+{
+    if (ptr != nullptr)
+    {
+        ptr->Release();
+        ptr = nullptr;
+    }
+}
+
+const int c_width = 7680;
+const int c_height = 3744;
 
 struct AdapterEnv
 {
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* context = nullptr;
+};
+
+struct QueryData
+{
+    void release()
+    {
+        releaseDXPtr(startQuery);
+        releaseDXPtr(endQuery);
+        releaseDXPtr(disjointQuery);
+    }
+    ID3D11Query* startQuery = nullptr;
+    ID3D11Query* endQuery = nullptr;
+    ID3D11Query* disjointQuery = nullptr;
 };
 
 void enableConsole()
@@ -109,16 +132,6 @@ HWND createRenderWindow(HINSTANCE hInstance, int nCmdShow)
     UpdateWindow(hwnd);
 
     return hwnd;
-}
-
-template<typename T>
-void releaseDXPtr(T*& ptr)
-{
-    if (ptr != nullptr)
-    {
-        ptr->Release();
-        ptr = nullptr;
-    }
 }
 
 IDXGIFactory1* createFactory()
@@ -254,6 +267,22 @@ ID3D11RenderTargetView* createWindowRtv(IDXGISwapChain* swapChain, ID3D11Device*
     return rtv;
 }
 
+QueryData createQueryData(ID3D11Device* device)
+{
+    D3D11_QUERY_DESC timestampDesc = {D3D11_QUERY_TIMESTAMP, 0};
+    D3D11_QUERY_DESC disjointDesc = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+
+    ID3D11Query* startQuery = nullptr;
+    ID3D11Query* endQuery = nullptr;
+    ID3D11Query* disjointQuery = nullptr;
+
+    device->CreateQuery(&timestampDesc, &startQuery);
+    device->CreateQuery(&timestampDesc, &endQuery);
+    device->CreateQuery(&disjointDesc, &disjointQuery);
+
+    return QueryData{startQuery, endQuery, disjointQuery};
+}
+
 IDXGIFactory1* m_factory = nullptr;
 AdapterEnv m_adapterEnv0;
 AdapterEnv m_adapterEnv1;
@@ -262,6 +291,8 @@ ID3D11RenderTargetView* m_rtv = nullptr;
 ID3D11Texture2D* m_stagingTexture = nullptr;
 IDXGISwapChain* m_swapChain = nullptr;
 ID3D11RenderTargetView* m_windowRtv = nullptr;
+QueryData m_queryData0;
+QueryData m_queryData1;
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow)
 {
@@ -282,6 +313,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     m_swapChain = createSwapChain(hwnd, m_adapterEnv0.device);
     m_windowRtv = createWindowRtv(m_swapChain, m_adapterEnv0.device);
+
+    m_queryData0 = createQueryData(m_adapterEnv0.device);
+    m_queryData1 = createQueryData(m_adapterEnv1.device);
 
     bool running = true;
     float blue = 0.0f;
@@ -317,14 +351,60 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         m_adapterEnv1.context->RSSetViewports(1, &viewport);
         m_adapterEnv1.context->OMSetRenderTargets(1, &m_rtv, nullptr);
         m_adapterEnv1.context->ClearRenderTargetView(m_rtv, clearColor);
-        m_adapterEnv1.context->CopyResource(m_stagingTexture, m_texture);
+
+        {
+            m_adapterEnv1.context->Begin(m_queryData1.disjointQuery);
+            m_adapterEnv1.context->End(m_queryData1.startQuery);
+            m_adapterEnv1.context->CopyResource(m_stagingTexture, m_texture);
+            m_adapterEnv1.context->End(m_queryData1.endQuery);
+            m_adapterEnv1.context->End(m_queryData1.disjointQuery);
+            UINT64 startTime = 0, endTime = 0;
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData;
+
+            while (m_adapterEnv1.context->GetData(m_queryData1.disjointQuery, &disjointData, sizeof(disjointData), 0) != S_OK)
+                ;
+            while (m_adapterEnv1.context->GetData(m_queryData1.startQuery, &startTime, sizeof(startTime), 0) != S_OK)
+                ;
+            while (m_adapterEnv1.context->GetData(m_queryData1.endQuery, &endTime, sizeof(endTime), 0) != S_OK)
+                ;
+
+            if (!disjointData.Disjoint)
+            {
+                double duration = static_cast<double>(endTime - startTime) / disjointData.Frequency;
+                std::cout << "Copy to staging: " << duration * 1000.0 << " ms" << std::endl;
+            }
+        }
+
         D3D11_MAPPED_SUBRESOURCE mappedResource;
         m_adapterEnv1.context->Map(m_stagingTexture, 0, D3D11_MAP_READ, 0, &mappedResource);
-        m_adapterEnv0.context->UpdateSubresource(backBuffer, 0, nullptr, mappedResource.pData, mappedResource.RowPitch, 0);
+        {
+            m_adapterEnv0.context->Begin(m_queryData0.disjointQuery);
+            m_adapterEnv0.context->End(m_queryData0.startQuery);
+            m_adapterEnv0.context->UpdateSubresource(backBuffer, 0, nullptr, mappedResource.pData, mappedResource.RowPitch, 0);
+            m_adapterEnv0.context->End(m_queryData0.endQuery);
+            m_adapterEnv0.context->End(m_queryData0.disjointQuery);
+            UINT64 startTime = 0, endTime = 0;
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData;
+
+            while (m_adapterEnv0.context->GetData(m_queryData0.disjointQuery, &disjointData, sizeof(disjointData), 0) != S_OK)
+                ;
+            while (m_adapterEnv0.context->GetData(m_queryData0.startQuery, &startTime, sizeof(startTime), 0) != S_OK)
+                ;
+            while (m_adapterEnv0.context->GetData(m_queryData0.endQuery, &endTime, sizeof(endTime), 0) != S_OK)
+                ;
+
+            if (!disjointData.Disjoint)
+            {
+                double duration = static_cast<double>(endTime - startTime) / disjointData.Frequency;
+                std::cout << "Update subresource: " << duration * 1000.0 << " ms" << std::endl;
+            }
+        }
         m_adapterEnv1.context->Unmap(m_stagingTexture, 0);
         m_swapChain->Present(1, 0);
     }
 
+    m_queryData0.release();
+    m_queryData1.release();
     releaseDXPtr(m_windowRtv);
     releaseDXPtr(m_swapChain);
     releaseDXPtr(m_stagingTexture);
