@@ -21,10 +21,10 @@ set(_target "dx12")
 add_executable(${_target} WIN32 ${_source_list})
 target_link_libraries(${_target}
     PRIVATE
-        d12
         d3d12
         dxgi
         dxguid
         dxcompiler
         d3dcompiler
 )
+target_include_directories(${_target} PRIVATE ${_src_dir})
