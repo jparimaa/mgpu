@@ -34,6 +34,7 @@ const int c_width = 7680;
 const int c_height = 3744;
 const UINT c_swapChainFrameCount = 3;
 DXGI_FORMAT c_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+const int c_gpuCount = 2;
 
 const CD3DX12_RESOURCE_DESC c_textureDesc = CD3DX12_RESOURCE_DESC::Tex2D(
     c_format,
@@ -186,11 +187,11 @@ bool isCrossAdapterSupported(ComPtr<ID3D12Device> device)
     return options.CrossAdapterRowMajorTextureSupported;
 }
 
-ComPtr<ID3D12CommandQueue> createCommandQueue(ComPtr<ID3D12Device> device)
+ComPtr<ID3D12CommandQueue> createCommandQueue(ComPtr<ID3D12Device> device, D3D12_COMMAND_LIST_TYPE type)
 {
     D3D12_COMMAND_QUEUE_DESC queueDesc{};
     queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    queueDesc.Type = type;
 
     ComPtr<ID3D12CommandQueue> queue;
 
@@ -198,7 +199,7 @@ ComPtr<ID3D12CommandQueue> createCommandQueue(ComPtr<ID3D12Device> device)
     return queue;
 }
 
-ComPtr<IDXGISwapChain1> createSwapChain(ComPtr<IDXGIFactory4> factory, ComPtr<ID3D12CommandQueue> queue, HWND hwnd)
+ComPtr<IDXGISwapChain3> createSwapChain(ComPtr<IDXGIFactory4> factory, ComPtr<ID3D12CommandQueue> queue, HWND hwnd)
 {
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
     swapChainDesc.BufferCount = c_swapChainFrameCount;
@@ -218,7 +219,19 @@ ComPtr<IDXGISwapChain1> createSwapChain(ComPtr<IDXGIFactory4> factory, ComPtr<ID
         nullptr,
         &swapChain));
 
-    return swapChain;
+    ComPtr<IDXGISwapChain3> swapChain3;
+    CHECK_HR(swapChain.As(&swapChain3));
+    return swapChain3;
+}
+
+std::vector<ComPtr<ID3D12Resource>> getBackBuffers(ComPtr<IDXGISwapChain3> swapChain)
+{
+    std::vector<ComPtr<ID3D12Resource>> backBuffers(c_swapChainFrameCount);
+    for (int i = 0; i < c_swapChainFrameCount; ++i)
+    {
+        CHECK_HR(swapChain->GetBuffer(i, IID_PPV_ARGS(&backBuffers[i])));
+    }
+    return backBuffers;
 }
 
 ComPtr<ID3D12DescriptorHeap> createRtvHeap(ComPtr<ID3D12Device> device)
@@ -264,11 +277,21 @@ void createRtvs(ComPtr<ID3D12Device> device, ComPtr<ID3D12DescriptorHeap> heap, 
     }
 }
 
-ComPtr<ID3D12CommandAllocator> createCommandAllocator(ComPtr<ID3D12Device> device)
+std::vector<ComPtr<ID3D12CommandAllocator>> createCommandAllocators(ComPtr<ID3D12Device> device, D3D12_COMMAND_LIST_TYPE type)
 {
-    ComPtr<ID3D12CommandAllocator> allocator;
-    CHECK_HR(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
-    return allocator;
+    std::vector<ComPtr<ID3D12CommandAllocator>> allocators(c_swapChainFrameCount);
+    for (int i = 0; i < c_swapChainFrameCount; ++i)
+    {
+        CHECK_HR(device->CreateCommandAllocator(type, IID_PPV_ARGS(&allocators[i])));
+    }
+    return allocators;
+}
+
+ComPtr<ID3D12GraphicsCommandList> createCommandList(ComPtr<ID3D12Device> device, D3D12_COMMAND_LIST_TYPE type, ComPtr<ID3D12CommandAllocator> allocator)
+{
+    ComPtr<ID3D12GraphicsCommandList> list;
+    CHECK_HR(device->CreateCommandList(0, type, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
+    return list;
 }
 
 ComPtr<ID3D12Heap> createSharedHeap(ComPtr<ID3D12Device> device)
@@ -288,7 +311,7 @@ ComPtr<ID3D12Heap> createSharedHeap(ComPtr<ID3D12Device> device)
     return heap;
 }
 
-HANDLE createSharedHandle(ComPtr<ID3D12Device> device, ComPtr<ID3D12Heap> heap)
+HANDLE createSharedHeapHandle(ComPtr<ID3D12Device> device, ComPtr<ID3D12Heap> heap)
 {
     HANDLE heapHandle = nullptr;
     CHECK_HR(device->CreateSharedHandle(
@@ -301,19 +324,19 @@ HANDLE createSharedHandle(ComPtr<ID3D12Device> device, ComPtr<ID3D12Heap> heap)
     return heapHandle;
 }
 
-ComPtr<ID3D12Heap> openSharedHandle(ComPtr<ID3D12Device> device, HANDLE handle)
+ComPtr<ID3D12Heap> openSharedHeapHandle(ComPtr<ID3D12Device> device, HANDLE handle)
 {
     ComPtr<ID3D12Heap> sharedHeap;
     CHECK_HR(device->OpenSharedHandle(handle, IID_PPV_ARGS(&sharedHeap)));
     return sharedHeap;
 }
 
-std::vector<ComPtr<ID3D12Resource>> createSharedHeapResource(ComPtr<ID3D12Device> device, ComPtr<ID3D12Heap> heap, D3D12_RESOURCE_STATES states)
+std::vector<ComPtr<ID3D12Resource>> createSharedHeapTexture(ComPtr<ID3D12Device> device, ComPtr<ID3D12Heap> heap, D3D12_RESOURCE_STATES states)
 {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
     device->GetCopyableFootprints(&c_textureDesc, 0, 1, 0, &layout, nullptr, nullptr, nullptr);
     UINT textureSize = align(layout.Footprint.RowPitch * layout.Footprint.Height);
-    D3D12_RESOURCE_DESC crossAdapterDesc = CD3DX12_RESOURCE_DESC::Buffer(textureSize, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
+    D3D12_RESOURCE_DESC crossAdapterDesc = CD3DX12_RESOURCE_DESC::Buffer(textureSize, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
 
     std::vector<ComPtr<ID3D12Resource>> resources(c_swapChainFrameCount);
 
@@ -329,6 +352,33 @@ std::vector<ComPtr<ID3D12Resource>> createSharedHeapResource(ComPtr<ID3D12Device
     }
 
     return resources;
+}
+
+ComPtr<ID3D12Fence> createFence(ComPtr<ID3D12Device> device, D3D12_FENCE_FLAGS flags)
+{
+    ComPtr<ID3D12Fence> fence;
+    CHECK_HR(device->CreateFence(1, flags, IID_PPV_ARGS(&fence)));
+    return fence;
+}
+
+HANDLE createSharedFenceHandle(ComPtr<ID3D12Device> device, ComPtr<ID3D12Fence> fence)
+{
+    HANDLE fenceHandle = nullptr;
+    CHECK_HR(device->CreateSharedHandle(
+        fence.Get(),
+        nullptr,
+        GENERIC_ALL,
+        nullptr,
+        &fenceHandle));
+
+    return fenceHandle;
+}
+
+ComPtr<ID3D12Fence> openSharedFenceHandle(ComPtr<ID3D12Device> device, HANDLE handle)
+{
+    ComPtr<ID3D12Fence> sharedFence;
+    CHECK_HR(device->OpenSharedHandle(handle, IID_PPV_ARGS(&sharedFence)));
+    return sharedFence;
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow)
@@ -351,29 +401,107 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     //CHECK(isCrossAdapterSupported(device0));
     //CHECK(isCrossAdapterSupported(device1));
 
-    ComPtr<ID3D12CommandQueue> queue0 = createCommandQueue(device0);
-    ComPtr<ID3D12CommandQueue> queue1 = createCommandQueue(device1);
+    ComPtr<ID3D12CommandQueue> directQueue0 = createCommandQueue(device0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    ComPtr<ID3D12CommandQueue> directQueue1 = createCommandQueue(device1, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    ComPtr<ID3D12CommandQueue> copyQueue1 = createCommandQueue(device1, D3D12_COMMAND_LIST_TYPE_COPY);
 
-    ComPtr<IDXGISwapChain1> swapChain = createSwapChain(factory, queue0, hwnd);
+    ComPtr<IDXGISwapChain3> swapChain = createSwapChain(factory, directQueue0, hwnd);
+    std::vector<ComPtr<ID3D12Resource>> backBuffers = getBackBuffers(swapChain);
+    int frameIndex = swapChain->GetCurrentBackBufferIndex();
+
+    ComPtr<ID3D12DescriptorHeap> rtvHeap0 = createRtvHeap(device0);
+    createRtvs(device0, rtvHeap0, backBuffers);
 
     ComPtr<ID3D12DescriptorHeap> rtvHeap1 = createRtvHeap(device1);
     std::vector<ComPtr<ID3D12Resource>> textures = createTextures(device1);
     createRtvs(device1, rtvHeap1, textures);
 
-    ComPtr<ID3D12CommandAllocator> commandAllocator0 = createCommandAllocator(device0);
-    ComPtr<ID3D12CommandAllocator> commandAllocator1 = createCommandAllocator(device1);
+    std::vector<ComPtr<ID3D12CommandAllocator>> commandAllocators0 = createCommandAllocators(device0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    std::vector<ComPtr<ID3D12CommandAllocator>> commandAllocators1 = createCommandAllocators(device1, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    std::vector<ComPtr<ID3D12CommandAllocator>> copyCommandAllocators1 = createCommandAllocators(device1, D3D12_COMMAND_LIST_TYPE_COPY);
+
+    ComPtr<ID3D12GraphicsCommandList> list0 = createCommandList(device0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators0[0]);
+    ComPtr<ID3D12GraphicsCommandList> list1 = createCommandList(device1, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators1[0]);
+    ComPtr<ID3D12GraphicsCommandList> copyList1 = createCommandList(device1, D3D12_COMMAND_LIST_TYPE_COPY, copyCommandAllocators1[0]);
 
     ComPtr<ID3D12Heap> sharedHeap1 = createSharedHeap(device1);
-    HANDLE sharedHeapHandle = createSharedHandle(device1, sharedHeap1);
-    ComPtr<ID3D12Heap> sharedHeap0 = openSharedHandle(device0, sharedHeapHandle);
+    HANDLE sharedHeapHandle = createSharedHeapHandle(device1, sharedHeap1);
+    ComPtr<ID3D12Heap> sharedHeap0 = openSharedHeapHandle(device0, sharedHeapHandle);
 
-    std::vector<ComPtr<ID3D12Resource>> sharedHeapResources0 = createSharedHeapResource(device0, sharedHeap0, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    std::vector<ComPtr<ID3D12Resource>> sharedHeapResources1 = createSharedHeapResource(device1, sharedHeap1, D3D12_RESOURCE_STATE_COPY_DEST);
-    /*
-    createSharedHeap on 1
-    createshared texture 
-    createSharedHandle on 1
-    open shared handle 2
-    */
+    std::vector<ComPtr<ID3D12Resource>> sharedHeapResources0 = createSharedHeapTexture(device0, sharedHeap0, D3D12_RESOURCE_STATE_COPY_DEST);
+    std::vector<ComPtr<ID3D12Resource>> sharedHeapResources1 = createSharedHeapTexture(device1, sharedHeap1, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    ComPtr<ID3D12Fence> frameFence = createFence(device0, D3D12_FENCE_FLAG_NONE);
+    ComPtr<ID3D12Fence> renderFence = createFence(device1, D3D12_FENCE_FLAG_NONE);
+    ComPtr<ID3D12Fence> crossAdapterFence1 = createFence(device1, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER);
+    HANDLE sharedFenceHandle = createSharedFenceHandle(device1, crossAdapterFence1);
+    ComPtr<ID3D12Fence> crossAdapterFence0 = openSharedFenceHandle(device0, sharedFenceHandle);
+    std::vector<UINT64> frameFenceValues(c_swapChainFrameCount, 0);
+    UINT64 presentFenceValue = 2;
+    std::vector<HANDLE> fenceEvents(c_gpuCount, CreateEvent(nullptr, FALSE, FALSE, nullptr));
+
+    const UINT rtvDescriptorSize = device0->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    bool running = true;
+    float blue = 0.0f;
+
+    bool first = true;
+
+    CHECK_HR(list0->Close());
+    CHECK_HR(list1->Close());
+    CHECK_HR(copyList1->Close());
+
+    while (running)
+    {
+        MSG msg = {};
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+            if (msg.message == WM_QUIT)
+            {
+                running = false;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        CHECK_HR(commandAllocators0[frameIndex]->Reset());
+        CHECK_HR(list0->Reset(commandAllocators0[frameIndex].Get(), nullptr));
+
+        ID3D12Resource* backBuffer = backBuffers[frameIndex].Get();
+        D3D12_RESOURCE_STATES state = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PRESENT;
+        list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, state, D3D12_RESOURCE_STATE_RENDER_TARGET));
+
+        blue = blue > 1.0f ? 0.0f : blue + 0.01f;
+        float clearColor[4] = {0.0f, 0.2f, blue, 1.0f};
+        CD3DX12_CPU_DESCRIPTOR_HANDLE backBufferRtv = CD3DX12_CPU_DESCRIPTOR_HANDLE(rtvHeap0->GetCPUDescriptorHandleForHeapStart(), frameIndex, rtvDescriptorSize);
+
+        list0->ClearRenderTargetView(backBufferRtv, clearColor, 0, nullptr);
+
+        list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
+
+        CHECK_HR(list0->Close());
+
+        std::vector<ID3D12CommandList*> cmdLists{list0.Get()};
+        directQueue0->ExecuteCommandLists(static_cast<UINT>(cmdLists.size()), cmdLists.data());
+
+        swapChain->Present(1, 0);
+
+        CHECK_HR(directQueue0->Signal(frameFence.Get(), presentFenceValue));
+        frameFenceValues[frameIndex] = presentFenceValue;
+        ++presentFenceValue;
+
+        frameIndex = swapChain->GetCurrentBackBufferIndex();
+
+        const UINT64 completedFenceValue = frameFence->GetCompletedValue();
+        if (completedFenceValue < frameFenceValues[frameIndex])
+        {
+            CHECK_HR(frameFence->SetEventOnCompletion(frameFenceValues[frameIndex], fenceEvents[0]));
+            WaitForSingleObject(fenceEvents[0], INFINITE);
+        }
+
+        first = false;
+    }
+
     return 0;
 }
