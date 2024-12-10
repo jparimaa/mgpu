@@ -4,6 +4,7 @@
 
 #include <iostream>
 #include <vector>
+#include <fstream>
 
 #define CHECK(f)                                                                                      \
     do                                                                                                \
@@ -445,9 +446,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         copyTimeTotal0 += t;
     }
 
-    std::cout << "Average copy times" << std::endl
-              << "0: " << (copyTimeTotal0 / copyTimes0.size() * 1000.0) << "ms" << std::endl
-              << "1: " << (copyTimeTotal1 / copyTimes1.size() * 1000.0) << "ms" << std::endl;
+    std::ofstream myfile;
+    myfile.open("dx11out.txt");
+    myfile << "Average copy times" << std::endl
+           << "0: " << (copyTimeTotal0 / copyTimes0.size() * 1000.0) << "ms" << std::endl
+           << "1: " << (copyTimeTotal1 / copyTimes1.size() * 1000.0) << "ms" << std::endl;
+    myfile.close();
 
     return 0;
 }
