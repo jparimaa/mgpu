@@ -50,6 +50,12 @@ const CD3DX12_RESOURCE_DESC c_textureDesc = CD3DX12_RESOURCE_DESC::Tex2D(
     D3D12_TEXTURE_LAYOUT_UNKNOWN,
     0u);
 
+struct QueryData
+{
+    UINT64 start;
+    UINT64 end;
+};
+
 UINT align(UINT size, UINT alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
 {
     return (size + alignment - 1) & ~(alignment - 1);
@@ -276,20 +282,29 @@ void createRtvs(ComPtr<ID3D12Device> device, ComPtr<ID3D12DescriptorHeap> heap, 
     }
 }
 
-std::vector<ComPtr<ID3D12CommandAllocator>> createCommandAllocators(ComPtr<ID3D12Device> device, D3D12_COMMAND_LIST_TYPE type)
+std::vector<ComPtr<ID3D12CommandAllocator>> createCommandAllocators(ComPtr<ID3D12Device> device, D3D12_COMMAND_LIST_TYPE type, const std::wstring& name = L"")
 {
     std::vector<ComPtr<ID3D12CommandAllocator>> allocators(c_swapChainFrameCount);
     for (int i = 0; i < c_swapChainFrameCount; ++i)
     {
         CHECK_HR(device->CreateCommandAllocator(type, IID_PPV_ARGS(&allocators[i])));
+        if (!name.empty())
+        {
+            std::wstring wn = name + std::to_wstring(i);
+            allocators[i]->SetName(wn.c_str());
+        }
     }
     return allocators;
 }
 
-ComPtr<ID3D12GraphicsCommandList> createCommandList(ComPtr<ID3D12Device> device, D3D12_COMMAND_LIST_TYPE type, ComPtr<ID3D12CommandAllocator> allocator)
+ComPtr<ID3D12GraphicsCommandList> createCommandList(ComPtr<ID3D12Device> device, D3D12_COMMAND_LIST_TYPE type, ComPtr<ID3D12CommandAllocator> allocator, const std::wstring& name = L"")
 {
     ComPtr<ID3D12GraphicsCommandList> list;
     CHECK_HR(device->CreateCommandList(0, type, allocator.Get(), nullptr, IID_PPV_ARGS(&list)));
+    if (!name.empty())
+    {
+        list->SetName(name.c_str());
+    }
     return list;
 }
 
@@ -380,12 +395,40 @@ ComPtr<ID3D12Fence> openSharedFenceHandle(ComPtr<ID3D12Device> device, HANDLE ha
     return sharedFence;
 }
 
+ComPtr<ID3D12QueryHeap> createQueryHeap(ComPtr<ID3D12Device> device, D3D12_QUERY_HEAP_TYPE type)
+{
+    D3D12_QUERY_HEAP_DESC queryHeapDesc{};
+    queryHeapDesc.Count = 2; // One for the start timestamp, one for the end timestamp
+    queryHeapDesc.Type = type;
+
+    ComPtr<ID3D12QueryHeap> queryHeap;
+    device->CreateQueryHeap(&queryHeapDesc, IID_PPV_ARGS(&queryHeap));
+    return queryHeap;
+}
+
+ComPtr<ID3D12Resource> createReadbackBuffer(ComPtr<ID3D12Device> device)
+{
+    CD3DX12_HEAP_PROPERTIES readbackHeapProps(D3D12_HEAP_TYPE_READBACK);
+    CD3DX12_RESOURCE_DESC readbackBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(sizeof(UINT64) * 2);
+
+    ComPtr<ID3D12Resource> readbackBuffer;
+    device->CreateCommittedResource(
+        &readbackHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &readbackBufferDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&readbackBuffer));
+    return readbackBuffer;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow)
 {
     /*
     - render (=clear) to a texture on device1
     - copy the result to shared heap 
-    - copy from shared heap to swapchain backbuffer    
+    - copy from shared heap to swapchain backbuffer
+    - present on adapter 0 
     */
     enableConsole();
     HWND hwnd = createRenderWindow(hInstance, nCmdShow);
@@ -397,8 +440,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     ComPtr<ID3D12Device> device0 = createDevice(adapters[0]);
     ComPtr<ID3D12Device> device1 = createDevice(adapters[1]);
 
-    //CHECK(isCrossAdapterSupported(device0));
-    //CHECK(isCrossAdapterSupported(device1));
+    std::cout << "0: isCrossAdapterSupported = " << isCrossAdapterSupported(device0) << std::endl;
+    std::cout << "1: isCrossAdapterSupported = " << isCrossAdapterSupported(device1) << std::endl;
 
     ComPtr<ID3D12CommandQueue> directQueue0 = createCommandQueue(device0, D3D12_COMMAND_LIST_TYPE_DIRECT);
     ComPtr<ID3D12CommandQueue> directQueue1 = createCommandQueue(device1, D3D12_COMMAND_LIST_TYPE_DIRECT);
@@ -415,14 +458,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     std::vector<ComPtr<ID3D12Resource>> textures = createTextures(device1);
     createRtvs(device1, rtvHeap1, textures);
 
-    std::vector<ComPtr<ID3D12CommandAllocator>> commandAllocators0 = createCommandAllocators(device0, D3D12_COMMAND_LIST_TYPE_DIRECT);
-    std::vector<ComPtr<ID3D12CommandAllocator>> commandAllocators1 = createCommandAllocators(device1, D3D12_COMMAND_LIST_TYPE_DIRECT);
-    std::vector<ComPtr<ID3D12CommandAllocator>> copyCommandAllocators1 = createCommandAllocators(device1, D3D12_COMMAND_LIST_TYPE_COPY);
+    std::vector<ComPtr<ID3D12CommandAllocator>> commandAllocators0 = createCommandAllocators(device0, D3D12_COMMAND_LIST_TYPE_DIRECT, L"allocator0_");
+    std::vector<ComPtr<ID3D12CommandAllocator>> commandAllocators1 = createCommandAllocators(device1, D3D12_COMMAND_LIST_TYPE_DIRECT, L"allocator1_");
+    std::vector<ComPtr<ID3D12CommandAllocator>> copyCommandAllocators1 = createCommandAllocators(device1, D3D12_COMMAND_LIST_TYPE_COPY, L"copyAllocator_");
 
-    ComPtr<ID3D12GraphicsCommandList> list0 = createCommandList(device0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators0[0]);
-    ComPtr<ID3D12GraphicsCommandList> list1 = createCommandList(device1, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators1[0]);
-    ComPtr<ID3D12GraphicsCommandList> copyList1 = createCommandList(device1, D3D12_COMMAND_LIST_TYPE_COPY, copyCommandAllocators1[0]);
+    ComPtr<ID3D12GraphicsCommandList> list0 = createCommandList(device0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators0[0], L"list0");
+    ComPtr<ID3D12GraphicsCommandList> list1 = createCommandList(device1, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators1[0], L"list1");
+    ComPtr<ID3D12GraphicsCommandList> copyList1 = createCommandList(device1, D3D12_COMMAND_LIST_TYPE_COPY, copyCommandAllocators1[0], L"copyList");
 
+    // Create a shared heap that is accessible from both GPUs.
+    // The heap is created on GPU 1 and then a shared handle is obtained for it
+    // and the shared handle is openeed on GPU 0
     ComPtr<ID3D12Heap> sharedHeap1 = createSharedHeap(device1);
     HANDLE sharedHeapHandle = createSharedHeapHandle(device1, sharedHeap1);
     ComPtr<ID3D12Heap> sharedHeap0 = openSharedHeapHandle(device0, sharedHeapHandle);
@@ -432,6 +478,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     ComPtr<ID3D12Fence> frameFence = createFence(device0, D3D12_FENCE_FLAG_NONE);
     ComPtr<ID3D12Fence> renderFence = createFence(device1, D3D12_FENCE_FLAG_NONE);
+    // Create a shared fence, similar to shared heap
     ComPtr<ID3D12Fence> sharedFence1 = createFence(device1, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER);
     HANDLE sharedFenceHandle = createSharedFenceHandle(device1, sharedFence1);
     ComPtr<ID3D12Fence> sharedFence0 = openSharedFenceHandle(device0, sharedFenceHandle);
@@ -441,8 +488,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     UINT64 sharedFenceValue = 2;
     HANDLE frameFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
+    ComPtr<ID3D12QueryHeap> queryHeap0 = createQueryHeap(device0, D3D12_QUERY_HEAP_TYPE_TIMESTAMP);
+    ComPtr<ID3D12QueryHeap> queryHeap1 = createQueryHeap(device1, D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP);
+    ComPtr<ID3D12Resource> readBackBuffer0 = createReadbackBuffer(device0);
+    ComPtr<ID3D12Resource> readBackBuffer1 = createReadbackBuffer(device1);
+
     const UINT rtvDescriptorSize0 = device0->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const UINT rtvDescriptorSize1 = device1->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    UINT64 timestampFrequency0 = 0;
+    directQueue0->GetTimestampFrequency(&timestampFrequency0);
+    UINT64 timestampFrequency1 = 0;
+    directQueue1->GetTimestampFrequency(&timestampFrequency1);
+    UINT64 timestampFrequencyCopyQueue = 0;
+    copyQueue1->GetTimestampFrequency(&timestampFrequencyCopyQueue);
 
     bool running = true;
     float blue = 0.0f;
@@ -453,10 +512,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     CHECK_HR(list1->Close());
     CHECK_HR(copyList1->Close());
 
-    int i = 0;
+    std::vector<QueryData> queryData0;
+    std::vector<QueryData> queryData1;
+
     while (running)
     {
-        ++i;
         MSG msg = {};
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
         {
@@ -470,20 +530,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
 
         {
+            // Render (=clear) on GPU 1
             CHECK_HR(commandAllocators1[frameIndex]->Reset());
             CHECK_HR(list1->Reset(commandAllocators1[frameIndex].Get(), nullptr));
 
             ID3D12Resource* tex = textures[frameIndex].Get();
-            D3D12_RESOURCE_STATES state = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_SOURCE;
-            list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex, state, D3D12_RESOURCE_STATE_RENDER_TARGET));
+            list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET));
 
             blue = blue > 1.0f ? 0.0f : blue + 0.01f;
             float clearColor[4] = {0.0f, 0.2f, blue, 1.0f};
             CD3DX12_CPU_DESCRIPTOR_HANDLE textureRtv = CD3DX12_CPU_DESCRIPTOR_HANDLE(rtvHeap1->GetCPUDescriptorHandleForHeapStart(), frameIndex, rtvDescriptorSize1);
 
             list1->ClearRenderTargetView(textureRtv, clearColor, 0, nullptr);
-            std::cout << i << std::endl;
-            list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON));
 
             CHECK_HR(list1->Close());
 
@@ -493,11 +552,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
 
         {
+            // Wait for the render to be completed
             CHECK_HR(copyQueue1->Wait(renderFence.Get(), renderFenceValue));
             ++renderFenceValue;
 
+            // Copy the result the shared heap
             CHECK_HR(copyCommandAllocators1[frameIndex]->Reset());
             CHECK_HR(copyList1->Reset(copyCommandAllocators1[frameIndex].Get(), nullptr));
+
+            copyList1->EndQuery(queryHeap1.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
             D3D12_RESOURCE_DESC textureDesc = textures[frameIndex]->GetDesc();
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT renderTargetLayout;
@@ -509,6 +572,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
             copyList1->CopyTextureRegion(&dest, 0, 0, 0, &src, &box);
 
+            copyList1->EndQuery(queryHeap1.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            copyList1->ResolveQueryData(
+                queryHeap1.Get(),
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                0, // Start index
+                2, // Number of queries
+                readBackBuffer1.Get(),
+                0); // Destination buffer offset
+
             CHECK_HR(copyList1->Close());
 
             ID3D12CommandList* commandLists[] = {copyList1.Get()};
@@ -517,11 +589,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CHECK_HR(copyQueue1->Signal(sharedFence1.Get(), sharedFenceValue));
         }
         {
+            // Wait for the copy to be completed
             CHECK_HR(directQueue0->Wait(sharedFence0.Get(), sharedFenceValue));
             ++sharedFenceValue;
 
+            {
+                // Copy the timestamp results after the copy queue is completed
+                UINT64* mappedData = nullptr;
+                readBackBuffer1->Map(0, nullptr, reinterpret_cast<void**>(&mappedData));
+                QueryData queryData{};
+                queryData.start = mappedData[0];
+                queryData.end = mappedData[1];
+                readBackBuffer1->Unmap(0, nullptr);
+                queryData1.push_back(queryData);
+            }
+
+            // Copy the result from shared heap to back buffer
+            // Todo: would it be better to use a copy queue?
             CHECK_HR(commandAllocators0[frameIndex]->Reset());
             CHECK_HR(list0->Reset(commandAllocators0[frameIndex].Get(), nullptr));
+
+            list0->EndQuery(queryHeap0.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
             ID3D12Resource* backBuffer = backBuffers[frameIndex].Get();
             D3D12_RESOURCE_STATES state = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PRESENT;
@@ -539,6 +627,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
             list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT));
 
+            list0->EndQuery(queryHeap0.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            list0->ResolveQueryData(
+                queryHeap0.Get(),
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                0, // Start index
+                2, // Number of queries
+                readBackBuffer0.Get(),
+                0); // Destination buffer offset
+
             CHECK_HR(list0->Close());
 
             ID3D12CommandList* commandLists[] = {list0.Get()};
@@ -548,7 +645,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         swapChain->Present(1, 0);
 
         CHECK_HR(directQueue0->Signal(frameFence.Get(), presentFenceValue));
+        CHECK_HR(directQueue0->Wait(frameFence.Get(), presentFenceValue));
         frameFenceValues[frameIndex] = presentFenceValue;
+
+        {
+            // Copy the timestamp results after queue is completed
+            UINT64* mappedData = nullptr;
+            readBackBuffer0->Map(0, nullptr, reinterpret_cast<void**>(&mappedData));
+            QueryData queryData{};
+            queryData.start = mappedData[0];
+            queryData.end = mappedData[1];
+            readBackBuffer0->Unmap(0, nullptr);
+            queryData0.push_back(queryData);
+        }
+
         ++presentFenceValue;
 
         frameIndex = swapChain->GetCurrentBackBufferIndex();
@@ -573,5 +683,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
 
+    double copyTimeTotal1 = 0.0;
+    for (const QueryData& q : queryData1)
+    {
+        double elapsedTimeInSeconds = static_cast<double>(q.end - q.start) / timestampFrequencyCopyQueue;
+        copyTimeTotal1 += elapsedTimeInSeconds;
+    }
+
+    double copyTimeTotal0 = 0.0;
+    for (const QueryData& q : queryData0)
+    {
+        double elapsedTimeInSeconds = static_cast<double>(q.end - q.start) / timestampFrequencyCopyQueue;
+        copyTimeTotal0 += elapsedTimeInSeconds;
+    }
+
+    std::cout << "Average copy times" << std::endl
+              << "0: " << (copyTimeTotal0 / queryData0.size() * 1000.0) << "ms" << std::endl
+              << "1: " << (copyTimeTotal1 / queryData1.size() * 1000.0) << "ms" << std::endl;
     return 0;
 }

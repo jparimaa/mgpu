@@ -59,6 +59,15 @@ void releaseDXPtr(T*& ptr)
 const int c_width = 7680;
 const int c_height = 3744;
 
+const D3D11_VIEWPORT c_viewport{
+    0.0f,
+    0.0f,
+    static_cast<float>(c_width),
+    static_cast<float>(c_height),
+    0.0f,
+    1.0f,
+};
+
 struct AdapterEnv
 {
     ID3D11Device* device = nullptr;
@@ -296,6 +305,13 @@ QueryData m_queryData1;
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow)
 {
+    /*
+    - render on adapter (gpu) 1
+    - copy the result from adapter 1 to host memory
+    - copy the result from host memory to adapter 0 
+    - present the result on adapter 0
+    */
+
     enableConsole();
     HWND hwnd = createRenderWindow(hInstance, nCmdShow);
 
@@ -323,13 +339,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     ID3D11Texture2D* backBuffer = nullptr;
     CHECK_HR(m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer));
 
-    D3D11_VIEWPORT viewport{};
-    viewport.TopLeftX = 0.0f;
-    viewport.TopLeftY = 0.0f;
-    viewport.Width = static_cast<float>(c_width);
-    viewport.Height = static_cast<float>(c_height);
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
+    std::vector<double> copyTimes0;
+    std::vector<double> copyTimes1;
 
     while (running)
     {
@@ -345,14 +356,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             DispatchMessage(&msg);
         }
 
+        // "Rendering", here only the render target is cleared though
         blue = blue > 1.0f ? 0.0f : blue + 0.01f;
         float clearColor[4] = {0.0f, 0.2f, blue, 1.0f};
-
-        m_adapterEnv1.context->RSSetViewports(1, &viewport);
+        m_adapterEnv1.context->RSSetViewports(1, &c_viewport);
         m_adapterEnv1.context->OMSetRenderTargets(1, &m_rtv, nullptr);
         m_adapterEnv1.context->ClearRenderTargetView(m_rtv, clearColor);
 
         {
+            // Copy from adapter 1 to host memory
             m_adapterEnv1.context->Begin(m_queryData1.disjointQuery);
             m_adapterEnv1.context->End(m_queryData1.startQuery);
             m_adapterEnv1.context->CopyResource(m_stagingTexture, m_texture);
@@ -371,13 +383,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!disjointData.Disjoint)
             {
                 double duration = static_cast<double>(endTime - startTime) / disjointData.Frequency;
-                std::cout << "Copy to staging: " << duration * 1000.0 << " ms" << std::endl;
+                copyTimes1.push_back(duration);
             }
         }
 
         D3D11_MAPPED_SUBRESOURCE mappedResource;
         m_adapterEnv1.context->Map(m_stagingTexture, 0, D3D11_MAP_READ, 0, &mappedResource);
         {
+            // Copy from host memory to adapter 0
             m_adapterEnv0.context->Begin(m_queryData0.disjointQuery);
             m_adapterEnv0.context->End(m_queryData0.startQuery);
             m_adapterEnv0.context->UpdateSubresource(backBuffer, 0, nullptr, mappedResource.pData, mappedResource.RowPitch, 0);
@@ -396,7 +409,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             if (!disjointData.Disjoint)
             {
                 double duration = static_cast<double>(endTime - startTime) / disjointData.Frequency;
-                std::cout << "Update subresource: " << duration * 1000.0 << " ms" << std::endl;
+                copyTimes0.push_back(duration);
             }
         }
         m_adapterEnv1.context->Unmap(m_stagingTexture, 0);
@@ -419,5 +432,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         releaseDXPtr(adapter);
     }
     releaseDXPtr(m_factory);
+
+    double copyTimeTotal1 = 0.0;
+    for (double t : copyTimes1)
+    {
+        copyTimeTotal1 += t;
+    }
+
+    double copyTimeTotal0 = 0.0;
+    for (double t : copyTimes0)
+    {
+        copyTimeTotal0 += t;
+    }
+
+    std::cout << "Average copy times" << std::endl
+              << "0: " << (copyTimeTotal0 / copyTimes0.size() * 1000.0) << "ms" << std::endl
+              << "1: " << (copyTimeTotal1 / copyTimes1.size() * 1000.0) << "ms" << std::endl;
+
     return 0;
 }
