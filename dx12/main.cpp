@@ -5,6 +5,8 @@
 #include <wrl/client.h>
 #include <iostream>
 #include <vector>
+#include <thread>
+#include <chrono>
 
 using Microsoft::WRL::ComPtr;
 
@@ -248,9 +250,6 @@ ComPtr<ID3D12DescriptorHeap> createRtvHeap(ComPtr<ID3D12Device> device)
 
 std::vector<ComPtr<ID3D12Resource>> createTextures(ComPtr<ID3D12Device> device)
 {
-    const float clearColor[4] = {0.0f, 0.2f, 0.3f, 1.0f};
-    const CD3DX12_CLEAR_VALUE clearValue(c_format, clearColor);
-
     std::vector<ComPtr<ID3D12Resource>> textures(c_swapChainFrameCount);
     for (int i = 0; i < c_swapChainFrameCount; ++i)
     {
@@ -259,7 +258,7 @@ std::vector<ComPtr<ID3D12Resource>> createTextures(ComPtr<ID3D12Device> device)
             D3D12_HEAP_FLAG_NONE,
             &c_textureDesc,
             D3D12_RESOURCE_STATE_COMMON,
-            &clearValue,
+            nullptr,
             IID_PPV_ARGS(&textures[i])));
     }
     return textures;
@@ -331,7 +330,7 @@ ComPtr<ID3D12Heap> openSharedHeapHandle(ComPtr<ID3D12Device> device, HANDLE hand
     return sharedHeap;
 }
 
-std::vector<ComPtr<ID3D12Resource>> createSharedHeapTexture(ComPtr<ID3D12Device> device, ComPtr<ID3D12Heap> heap, D3D12_RESOURCE_STATES states)
+std::vector<ComPtr<ID3D12Resource>> createSharedHeapTexture(ComPtr<ID3D12Device> device, ComPtr<ID3D12Heap> heap)
 {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
     device->GetCopyableFootprints(&c_textureDesc, 0, 1, 0, &layout, nullptr, nullptr, nullptr);
@@ -346,7 +345,7 @@ std::vector<ComPtr<ID3D12Resource>> createSharedHeapTexture(ComPtr<ID3D12Device>
             heap.Get(),
             textureSize * i,
             &crossAdapterDesc,
-            states,
+            D3D12_RESOURCE_STATE_COMMON,
             nullptr,
             IID_PPV_ARGS(&resources[i])));
     }
@@ -428,19 +427,22 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     HANDLE sharedHeapHandle = createSharedHeapHandle(device1, sharedHeap1);
     ComPtr<ID3D12Heap> sharedHeap0 = openSharedHeapHandle(device0, sharedHeapHandle);
 
-    std::vector<ComPtr<ID3D12Resource>> sharedHeapResources0 = createSharedHeapTexture(device0, sharedHeap0, D3D12_RESOURCE_STATE_COPY_DEST);
-    std::vector<ComPtr<ID3D12Resource>> sharedHeapResources1 = createSharedHeapTexture(device1, sharedHeap1, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    std::vector<ComPtr<ID3D12Resource>> sharedHeapTextures0 = createSharedHeapTexture(device0, sharedHeap0);
+    std::vector<ComPtr<ID3D12Resource>> sharedHeapTextures1 = createSharedHeapTexture(device1, sharedHeap1);
 
     ComPtr<ID3D12Fence> frameFence = createFence(device0, D3D12_FENCE_FLAG_NONE);
     ComPtr<ID3D12Fence> renderFence = createFence(device1, D3D12_FENCE_FLAG_NONE);
-    ComPtr<ID3D12Fence> crossAdapterFence1 = createFence(device1, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER);
-    HANDLE sharedFenceHandle = createSharedFenceHandle(device1, crossAdapterFence1);
-    ComPtr<ID3D12Fence> crossAdapterFence0 = openSharedFenceHandle(device0, sharedFenceHandle);
+    ComPtr<ID3D12Fence> sharedFence1 = createFence(device1, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER);
+    HANDLE sharedFenceHandle = createSharedFenceHandle(device1, sharedFence1);
+    ComPtr<ID3D12Fence> sharedFence0 = openSharedFenceHandle(device0, sharedFenceHandle);
     std::vector<UINT64> frameFenceValues(c_swapChainFrameCount, 0);
     UINT64 presentFenceValue = 2;
-    std::vector<HANDLE> fenceEvents(c_gpuCount, CreateEvent(nullptr, FALSE, FALSE, nullptr));
+    UINT64 renderFenceValue = 2;
+    UINT64 sharedFenceValue = 2;
+    HANDLE frameFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
-    const UINT rtvDescriptorSize = device0->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const UINT rtvDescriptorSize0 = device0->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const UINT rtvDescriptorSize1 = device1->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     bool running = true;
     float blue = 0.0f;
@@ -451,8 +453,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     CHECK_HR(list1->Close());
     CHECK_HR(copyList1->Close());
 
+    int i = 0;
     while (running)
     {
+        ++i;
         MSG msg = {};
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
         {
@@ -465,25 +469,81 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             DispatchMessage(&msg);
         }
 
-        CHECK_HR(commandAllocators0[frameIndex]->Reset());
-        CHECK_HR(list0->Reset(commandAllocators0[frameIndex].Get(), nullptr));
+        {
+            CHECK_HR(commandAllocators1[frameIndex]->Reset());
+            CHECK_HR(list1->Reset(commandAllocators1[frameIndex].Get(), nullptr));
 
-        ID3D12Resource* backBuffer = backBuffers[frameIndex].Get();
-        D3D12_RESOURCE_STATES state = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PRESENT;
-        list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, state, D3D12_RESOURCE_STATE_RENDER_TARGET));
+            ID3D12Resource* tex = textures[frameIndex].Get();
+            D3D12_RESOURCE_STATES state = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_SOURCE;
+            list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex, state, D3D12_RESOURCE_STATE_RENDER_TARGET));
 
-        blue = blue > 1.0f ? 0.0f : blue + 0.01f;
-        float clearColor[4] = {0.0f, 0.2f, blue, 1.0f};
-        CD3DX12_CPU_DESCRIPTOR_HANDLE backBufferRtv = CD3DX12_CPU_DESCRIPTOR_HANDLE(rtvHeap0->GetCPUDescriptorHandleForHeapStart(), frameIndex, rtvDescriptorSize);
+            blue = blue > 1.0f ? 0.0f : blue + 0.01f;
+            float clearColor[4] = {0.0f, 0.2f, blue, 1.0f};
+            CD3DX12_CPU_DESCRIPTOR_HANDLE textureRtv = CD3DX12_CPU_DESCRIPTOR_HANDLE(rtvHeap1->GetCPUDescriptorHandleForHeapStart(), frameIndex, rtvDescriptorSize1);
 
-        list0->ClearRenderTargetView(backBufferRtv, clearColor, 0, nullptr);
+            list1->ClearRenderTargetView(textureRtv, clearColor, 0, nullptr);
+            std::cout << i << std::endl;
+            list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE));
 
-        list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
+            CHECK_HR(list1->Close());
 
-        CHECK_HR(list0->Close());
+            ID3D12CommandList* commandLists[] = {list1.Get()};
+            directQueue1->ExecuteCommandLists(_countof(commandLists), commandLists);
+            CHECK_HR(directQueue1->Signal(renderFence.Get(), renderFenceValue));
+        }
 
-        std::vector<ID3D12CommandList*> cmdLists{list0.Get()};
-        directQueue0->ExecuteCommandLists(static_cast<UINT>(cmdLists.size()), cmdLists.data());
+        {
+            CHECK_HR(copyQueue1->Wait(renderFence.Get(), renderFenceValue));
+            ++renderFenceValue;
+
+            CHECK_HR(copyCommandAllocators1[frameIndex]->Reset());
+            CHECK_HR(copyList1->Reset(copyCommandAllocators1[frameIndex].Get(), nullptr));
+
+            D3D12_RESOURCE_DESC textureDesc = textures[frameIndex]->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT renderTargetLayout;
+            device1->GetCopyableFootprints(&textureDesc, 0, 1, 0, &renderTargetLayout, nullptr, nullptr, nullptr);
+
+            CD3DX12_TEXTURE_COPY_LOCATION dest(sharedHeapTextures1[frameIndex].Get(), renderTargetLayout);
+            CD3DX12_TEXTURE_COPY_LOCATION src(textures[frameIndex].Get(), 0);
+            CD3DX12_BOX box(0, 0, c_width, c_height);
+
+            copyList1->CopyTextureRegion(&dest, 0, 0, 0, &src, &box);
+
+            CHECK_HR(copyList1->Close());
+
+            ID3D12CommandList* commandLists[] = {copyList1.Get()};
+            copyQueue1->ExecuteCommandLists(_countof(commandLists), commandLists);
+
+            CHECK_HR(copyQueue1->Signal(sharedFence1.Get(), sharedFenceValue));
+        }
+        {
+            CHECK_HR(directQueue0->Wait(sharedFence0.Get(), sharedFenceValue));
+            ++sharedFenceValue;
+
+            CHECK_HR(commandAllocators0[frameIndex]->Reset());
+            CHECK_HR(list0->Reset(commandAllocators0[frameIndex].Get(), nullptr));
+
+            ID3D12Resource* backBuffer = backBuffers[frameIndex].Get();
+            D3D12_RESOURCE_STATES state = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PRESENT;
+            list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, state, D3D12_RESOURCE_STATE_COPY_DEST));
+
+            D3D12_RESOURCE_DESC backBufferTextureDesc = backBuffer->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT textureLayout;
+            device0->GetCopyableFootprints(&backBufferTextureDesc, 0, 1, 0, &textureLayout, nullptr, nullptr, nullptr);
+
+            CD3DX12_TEXTURE_COPY_LOCATION dest(backBuffer, 0);
+            CD3DX12_TEXTURE_COPY_LOCATION src(sharedHeapTextures0[frameIndex].Get(), textureLayout);
+            CD3DX12_BOX box(0, 0, c_width, c_height);
+
+            list0->CopyTextureRegion(&dest, 0, 0, 0, &src, &box);
+
+            list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT));
+
+            CHECK_HR(list0->Close());
+
+            ID3D12CommandList* commandLists[] = {list0.Get()};
+            directQueue0->ExecuteCommandLists(_countof(commandLists), commandLists);
+        }
 
         swapChain->Present(1, 0);
 
@@ -496,11 +556,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         const UINT64 completedFenceValue = frameFence->GetCompletedValue();
         if (completedFenceValue < frameFenceValues[frameIndex])
         {
-            CHECK_HR(frameFence->SetEventOnCompletion(frameFenceValues[frameIndex], fenceEvents[0]));
-            WaitForSingleObject(fenceEvents[0], INFINITE);
+            CHECK_HR(frameFence->SetEventOnCompletion(frameFenceValues[frameIndex], frameFenceEvent));
+            WaitForSingleObject(frameFenceEvent, INFINITE);
         }
 
         first = false;
+    }
+
+    UINT64 completedFenceValue = frameFence->GetCompletedValue();
+    for (int i = 0; i < c_swapChainFrameCount; ++i)
+    {
+        while (completedFenceValue < frameFenceValues[i])
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            completedFenceValue = frameFence->GetCompletedValue();
+        }
     }
 
     return 0;
