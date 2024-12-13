@@ -28,3 +28,17 @@ target_link_libraries(${_target}
         d3dcompiler
 )
 target_include_directories(${_target} PRIVATE ${_src_dir})
+
+set(_src_dir "${CMAKE_CURRENT_SOURCE_DIR}/dx12direct")
+file(GLOB _source_list "${_src_dir}/*.cpp" "${_src_dir}/*.hpp")
+set(_target "dx12direct")
+add_executable(${_target} WIN32 ${_source_list})
+target_link_libraries(${_target}
+    PRIVATE
+        d3d12
+        dxgi
+        dxguid
+        dxcompiler
+        d3dcompiler
+)
+target_include_directories(${_target} PRIVATE ${_src_dir})

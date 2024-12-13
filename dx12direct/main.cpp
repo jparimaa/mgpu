@@ -43,10 +43,10 @@ const CD3DX12_RESOURCE_DESC c_textureDesc = CD3DX12_RESOURCE_DESC::Tex2D(
     c_format,
     c_width,
     c_height,
-    1u,
-    1u,
-    1,
-    1,
+    1u, // array size
+    1u, // mip
+    1, // count
+    0, // quality
     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
     D3D12_TEXTURE_LAYOUT_UNKNOWN,
     0u);
@@ -255,15 +255,19 @@ ComPtr<ID3D12DescriptorHeap> createRtvHeap(ComPtr<ID3D12Device> device)
     return heap;
 }
 
-std::vector<ComPtr<ID3D12Resource>> createTextures(ComPtr<ID3D12Device> device)
+std::vector<ComPtr<ID3D12Resource>> createSharedTextures(ComPtr<ID3D12Device> device)
 {
+    CD3DX12_RESOURCE_DESC textureDesc = c_textureDesc;
+    textureDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    textureDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
     std::vector<ComPtr<ID3D12Resource>> textures(c_swapChainFrameCount);
     for (int i = 0; i < c_swapChainFrameCount; ++i)
     {
         CHECK_HR(device->CreateCommittedResource(
             &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
-            D3D12_HEAP_FLAG_NONE,
-            &c_textureDesc,
+            D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER,
+            &textureDesc,
             D3D12_RESOURCE_STATE_COMMON,
             nullptr,
             IID_PPV_ARGS(&textures[i])));
@@ -281,6 +285,36 @@ void createRtvs(ComPtr<ID3D12Device> device, ComPtr<ID3D12DescriptorHeap> heap, 
         device->CreateRenderTargetView(textures[i].Get(), nullptr, rtvHandle);
         rtvHandle.Offset(1, rtvDescriptorSize);
     }
+}
+
+std::vector<HANDLE> createSharedTextureHandles(ComPtr<ID3D12Device> device, std::vector<ComPtr<ID3D12Resource>> textures)
+{
+    std::vector<HANDLE> handles;
+    for (ComPtr<ID3D12Resource> texture : textures)
+    {
+        HANDLE handle = nullptr;
+        CHECK_HR(device->CreateSharedHandle(
+            texture.Get(),
+            nullptr,
+            GENERIC_ALL,
+            nullptr,
+            &handle));
+        handles.push_back(handle);
+    }
+    return handles;
+}
+
+std::vector<ComPtr<ID3D12Resource>> openSharedTextureHandles(ComPtr<ID3D12Device> device, std::vector<HANDLE> handles)
+{
+    std::vector<ComPtr<ID3D12Resource>> sharedTextures;
+    for (HANDLE handle : handles)
+    {
+        ComPtr<ID3D12Resource> tex;
+        CHECK_HR(device->OpenSharedHandle(handle, IID_PPV_ARGS(&tex)));
+        sharedTextures.push_back(tex);
+        CloseHandle(handle);
+    }
+    return sharedTextures;
 }
 
 std::vector<ComPtr<ID3D12CommandAllocator>> createCommandAllocators(ComPtr<ID3D12Device> device, D3D12_COMMAND_LIST_TYPE type, const std::wstring& name = L"")
@@ -427,9 +461,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 {
     /*
     - render (=clear) to a texture on device1
-    - copy the result to shared heap 
-    - copy from shared heap to swapchain backbuffer
-    - present on adapter 0 
+    - copy the result from gpu1 to gpu0 through cross adapter shared resource
+    - present on gpu0 
     */
     enableConsole();
     HWND hwnd = createRenderWindow(hInstance, nCmdShow);
@@ -446,46 +479,30 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     ComPtr<ID3D12CommandQueue> directQueue0 = createCommandQueue(device0, D3D12_COMMAND_LIST_TYPE_DIRECT);
     ComPtr<ID3D12CommandQueue> directQueue1 = createCommandQueue(device1, D3D12_COMMAND_LIST_TYPE_DIRECT);
-    ComPtr<ID3D12CommandQueue> copyQueue1 = createCommandQueue(device1, D3D12_COMMAND_LIST_TYPE_COPY);
 
     ComPtr<IDXGISwapChain3> swapChain = createSwapChain(factory, directQueue0, hwnd);
     std::vector<ComPtr<ID3D12Resource>> backBuffers = getBackBuffers(swapChain);
     int frameIndex = swapChain->GetCurrentBackBufferIndex();
 
-    ComPtr<ID3D12DescriptorHeap> rtvHeap0 = createRtvHeap(device0);
-    createRtvs(device0, rtvHeap0, backBuffers);
-
+    std::vector<ComPtr<ID3D12Resource>> textures1 = createSharedTextures(device1);
     ComPtr<ID3D12DescriptorHeap> rtvHeap1 = createRtvHeap(device1);
-    std::vector<ComPtr<ID3D12Resource>> textures = createTextures(device1);
-    createRtvs(device1, rtvHeap1, textures);
+    createRtvs(device1, rtvHeap1, textures1);
+    std::vector<HANDLE> sharedTextureHandles = createSharedTextureHandles(device1, textures1);
+    std::vector<ComPtr<ID3D12Resource>> textures0 = openSharedTextureHandles(device0, sharedTextureHandles);
 
     std::vector<ComPtr<ID3D12CommandAllocator>> commandAllocators0 = createCommandAllocators(device0, D3D12_COMMAND_LIST_TYPE_DIRECT, L"allocator0_");
     std::vector<ComPtr<ID3D12CommandAllocator>> commandAllocators1 = createCommandAllocators(device1, D3D12_COMMAND_LIST_TYPE_DIRECT, L"allocator1_");
-    std::vector<ComPtr<ID3D12CommandAllocator>> copyCommandAllocators1 = createCommandAllocators(device1, D3D12_COMMAND_LIST_TYPE_COPY, L"copyAllocator_");
 
     ComPtr<ID3D12GraphicsCommandList> list0 = createCommandList(device0, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators0[0], L"list0");
     ComPtr<ID3D12GraphicsCommandList> list1 = createCommandList(device1, D3D12_COMMAND_LIST_TYPE_DIRECT, commandAllocators1[0], L"list1");
-    ComPtr<ID3D12GraphicsCommandList> copyList1 = createCommandList(device1, D3D12_COMMAND_LIST_TYPE_COPY, copyCommandAllocators1[0], L"copyList");
-
-    // Create a shared heap that is accessible from both GPUs.
-    // The heap is created on GPU 1 and then a shared handle is obtained for it
-    // and the shared handle is openeed on GPU 0
-    ComPtr<ID3D12Heap> sharedHeap1 = createSharedHeap(device1);
-    HANDLE sharedHeapHandle = createSharedHeapHandle(device1, sharedHeap1);
-    ComPtr<ID3D12Heap> sharedHeap0 = openSharedHeapHandle(device0, sharedHeapHandle);
-
-    std::vector<ComPtr<ID3D12Resource>> sharedHeapTextures0 = createSharedHeapTexture(device0, sharedHeap0);
-    std::vector<ComPtr<ID3D12Resource>> sharedHeapTextures1 = createSharedHeapTexture(device1, sharedHeap1);
 
     ComPtr<ID3D12Fence> frameFence = createFence(device0, D3D12_FENCE_FLAG_NONE);
-    ComPtr<ID3D12Fence> renderFence = createFence(device1, D3D12_FENCE_FLAG_NONE);
     // Create a shared fence, similar to shared heap
     ComPtr<ID3D12Fence> sharedFence1 = createFence(device1, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER);
     HANDLE sharedFenceHandle = createSharedFenceHandle(device1, sharedFence1);
     ComPtr<ID3D12Fence> sharedFence0 = openSharedFenceHandle(device0, sharedFenceHandle);
     std::vector<UINT64> frameFenceValues(c_swapChainFrameCount, 0);
     UINT64 presentFenceValue = 2;
-    UINT64 renderFenceValue = 2;
     UINT64 sharedFenceValue = 2;
     HANDLE frameFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
@@ -494,15 +511,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     ComPtr<ID3D12Resource> readBackBuffer0 = createReadbackBuffer(device0);
     ComPtr<ID3D12Resource> readBackBuffer1 = createReadbackBuffer(device1);
 
-    const UINT rtvDescriptorSize0 = device0->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const UINT rtvDescriptorSize1 = device1->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     UINT64 timestampFrequency0 = 0;
     directQueue0->GetTimestampFrequency(&timestampFrequency0);
-    UINT64 timestampFrequency1 = 0;
-    directQueue1->GetTimestampFrequency(&timestampFrequency1);
-    UINT64 timestampFrequencyCopyQueue = 0;
-    copyQueue1->GetTimestampFrequency(&timestampFrequencyCopyQueue);
 
     bool running = true;
     float blue = 0.0f;
@@ -511,10 +523,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     CHECK_HR(list0->Close());
     CHECK_HR(list1->Close());
-    CHECK_HR(copyList1->Close());
 
     std::vector<QueryData> queryData0;
-    std::vector<QueryData> queryData1;
 
     while (running)
     {
@@ -535,96 +545,45 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CHECK_HR(commandAllocators1[frameIndex]->Reset());
             CHECK_HR(list1->Reset(commandAllocators1[frameIndex].Get(), nullptr));
 
-            ID3D12Resource* tex = textures[frameIndex].Get();
-            list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET));
+            ID3D12Resource* tex1 = textures1[frameIndex].Get();
+            if (first)
+            {
+                list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex1, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET));
+            }
 
             blue = blue > 1.0f ? 0.0f : blue + 0.01f;
             float clearColor[4] = {0.0f, 0.2f, blue, 1.0f};
             CD3DX12_CPU_DESCRIPTOR_HANDLE textureRtv = CD3DX12_CPU_DESCRIPTOR_HANDLE(rtvHeap1->GetCPUDescriptorHandleForHeapStart(), frameIndex, rtvDescriptorSize1);
 
             list1->ClearRenderTargetView(textureRtv, clearColor, 0, nullptr);
-            list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON));
 
             CHECK_HR(list1->Close());
 
             ID3D12CommandList* commandLists[] = {list1.Get()};
             directQueue1->ExecuteCommandLists(_countof(commandLists), commandLists);
-            CHECK_HR(directQueue1->Signal(renderFence.Get(), renderFenceValue));
-        }
-
-        {
-            // Wait for the render to be completed
-            CHECK_HR(copyQueue1->Wait(renderFence.Get(), renderFenceValue));
-            ++renderFenceValue;
-
-            // Copy the result the shared heap
-            CHECK_HR(copyCommandAllocators1[frameIndex]->Reset());
-            CHECK_HR(copyList1->Reset(copyCommandAllocators1[frameIndex].Get(), nullptr));
-
-            copyList1->EndQuery(queryHeap1.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
-
-            D3D12_RESOURCE_DESC textureDesc = textures[frameIndex]->GetDesc();
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT renderTargetLayout;
-            device1->GetCopyableFootprints(&textureDesc, 0, 1, 0, &renderTargetLayout, nullptr, nullptr, nullptr);
-
-            CD3DX12_TEXTURE_COPY_LOCATION dest(sharedHeapTextures1[frameIndex].Get(), renderTargetLayout);
-            CD3DX12_TEXTURE_COPY_LOCATION src(textures[frameIndex].Get(), 0);
-            CD3DX12_BOX box(0, 0, c_width, c_height);
-
-            copyList1->CopyTextureRegion(&dest, 0, 0, 0, &src, &box);
-
-            copyList1->EndQuery(queryHeap1.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
-            copyList1->ResolveQueryData(
-                queryHeap1.Get(),
-                D3D12_QUERY_TYPE_TIMESTAMP,
-                0, // Start index
-                2, // Number of queries
-                readBackBuffer1.Get(),
-                0); // Destination buffer offset
-
-            CHECK_HR(copyList1->Close());
-
-            ID3D12CommandList* commandLists[] = {copyList1.Get()};
-            copyQueue1->ExecuteCommandLists(_countof(commandLists), commandLists);
-
-            CHECK_HR(copyQueue1->Signal(sharedFence1.Get(), sharedFenceValue));
+            CHECK_HR(directQueue1->Signal(sharedFence1.Get(), sharedFenceValue));
         }
         {
             // Wait for the copy to be completed
             CHECK_HR(directQueue0->Wait(sharedFence0.Get(), sharedFenceValue));
             ++sharedFenceValue;
 
-            {
-                // Copy the timestamp results after the copy queue is completed
-                UINT64* mappedData = nullptr;
-                readBackBuffer1->Map(0, nullptr, reinterpret_cast<void**>(&mappedData));
-                QueryData queryData{};
-                queryData.start = mappedData[0];
-                queryData.end = mappedData[1];
-                readBackBuffer1->Unmap(0, nullptr);
-                queryData1.push_back(queryData);
-            }
-
-            // Copy the result from shared heap to back buffer
-            // Todo: would it be better to use a copy queue?
             CHECK_HR(commandAllocators0[frameIndex]->Reset());
             CHECK_HR(list0->Reset(commandAllocators0[frameIndex].Get(), nullptr));
 
             ID3D12Resource* backBuffer = backBuffers[frameIndex].Get();
-            D3D12_RESOURCE_STATES state = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PRESENT;
-            list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, state, D3D12_RESOURCE_STATE_COPY_DEST));
+            ID3D12Resource* tex0 = textures0[frameIndex].Get();
 
-            D3D12_RESOURCE_DESC backBufferTextureDesc = backBuffer->GetDesc();
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT textureLayout;
-            device0->GetCopyableFootprints(&backBufferTextureDesc, 0, 1, 0, &textureLayout, nullptr, nullptr, nullptr);
+            if (first)
+            {
+                list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
+            }
 
-            CD3DX12_TEXTURE_COPY_LOCATION dest(backBuffer, 0);
-            CD3DX12_TEXTURE_COPY_LOCATION src(sharedHeapTextures0[frameIndex].Get(), textureLayout);
-            CD3DX12_BOX box(0, 0, c_width, c_height);
+            D3D12_RESOURCE_STATES backBufferState = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PRESENT;
+            list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, backBufferState, D3D12_RESOURCE_STATE_COPY_DEST));
             list0->EndQuery(queryHeap0.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
-            list0->CopyTextureRegion(&dest, 0, 0, 0, &src, &box);
-
+            list0->CopyResource(backBuffer, tex0);
             list0->EndQuery(queryHeap0.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
 
             list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT));
@@ -649,6 +608,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         CHECK_HR(directQueue0->Wait(frameFence.Get(), presentFenceValue));
         frameFenceValues[frameIndex] = presentFenceValue;
 
+        ++presentFenceValue;
+
         {
             // Copy the timestamp results after queue is completed
             UINT64* mappedData = nullptr;
@@ -659,8 +620,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             readBackBuffer0->Unmap(0, nullptr);
             queryData0.push_back(queryData);
         }
-
-        ++presentFenceValue;
 
         frameIndex = swapChain->GetCurrentBackBufferIndex();
 
@@ -684,13 +643,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
 
-    double copyTimeTotal1 = 0.0;
-    for (const QueryData& q : queryData1)
-    {
-        double elapsedTimeInSeconds = static_cast<double>(q.end - q.start) / timestampFrequencyCopyQueue;
-        copyTimeTotal1 += elapsedTimeInSeconds;
-    }
-
     double copyTimeTotal0 = 0.0;
     for (const QueryData& q : queryData0)
     {
@@ -699,11 +651,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     }
 
     std::ofstream myfile;
-    myfile.open("dx12out.txt");
-    myfile << "Average copy times" << std::endl
-           << "0: " << (copyTimeTotal0 / queryData0.size() * 1000.0) << "ms" << std::endl
-           << "1: " << (copyTimeTotal1 / queryData1.size() * 1000.0) << "ms" << std::endl;
+    myfile.open("dx12directout.txt");
+    myfile << "Average copy times: " << (copyTimeTotal0 / queryData0.size() * 1000.0) << "ms" << std::endl;
     myfile.close();
-
     return 0;
 }
