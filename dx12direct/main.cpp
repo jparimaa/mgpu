@@ -255,10 +255,26 @@ ComPtr<ID3D12DescriptorHeap> createRtvHeap(ComPtr<ID3D12Device> device)
     return heap;
 }
 
+std::vector<ComPtr<ID3D12Resource>> createTextures(ComPtr<ID3D12Device> device)
+{
+    std::vector<ComPtr<ID3D12Resource>> textures(c_swapChainFrameCount);
+    for (int i = 0; i < c_swapChainFrameCount; ++i)
+    {
+        CHECK_HR(device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+            D3D12_HEAP_FLAG_NONE,
+            &c_textureDesc,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            IID_PPV_ARGS(&textures[i])));
+    }
+    return textures;
+}
+
 std::vector<ComPtr<ID3D12Resource>> createSharedTextures(ComPtr<ID3D12Device> device)
 {
     CD3DX12_RESOURCE_DESC textureDesc = c_textureDesc;
-    textureDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    textureDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
     textureDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
     std::vector<ComPtr<ID3D12Resource>> textures(c_swapChainFrameCount);
@@ -484,11 +500,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     std::vector<ComPtr<ID3D12Resource>> backBuffers = getBackBuffers(swapChain);
     int frameIndex = swapChain->GetCurrentBackBufferIndex();
 
-    std::vector<ComPtr<ID3D12Resource>> textures1 = createSharedTextures(device1);
+    std::vector<ComPtr<ID3D12Resource>> textures1 = createTextures(device1);
     ComPtr<ID3D12DescriptorHeap> rtvHeap1 = createRtvHeap(device1);
     createRtvs(device1, rtvHeap1, textures1);
-    std::vector<HANDLE> sharedTextureHandles = createSharedTextureHandles(device1, textures1);
-    std::vector<ComPtr<ID3D12Resource>> textures0 = openSharedTextureHandles(device0, sharedTextureHandles);
+
+    std::vector<ComPtr<ID3D12Resource>> sharedTextures1 = createSharedTextures(device1);
+    std::vector<HANDLE> sharedTextureHandles = createSharedTextureHandles(device1, sharedTextures1);
+    std::vector<ComPtr<ID3D12Resource>> sharedTextures0 = openSharedTextureHandles(device0, sharedTextureHandles);
 
     std::vector<ComPtr<ID3D12CommandAllocator>> commandAllocators0 = createCommandAllocators(device0, D3D12_COMMAND_LIST_TYPE_DIRECT, L"allocator0_");
     std::vector<ComPtr<ID3D12CommandAllocator>> commandAllocators1 = createCommandAllocators(device1, D3D12_COMMAND_LIST_TYPE_DIRECT, L"allocator1_");
@@ -507,7 +525,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     HANDLE frameFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
     ComPtr<ID3D12QueryHeap> queryHeap0 = createQueryHeap(device0, D3D12_QUERY_HEAP_TYPE_TIMESTAMP);
-    ComPtr<ID3D12QueryHeap> queryHeap1 = createQueryHeap(device1, D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP);
+    ComPtr<ID3D12QueryHeap> queryHeap1 = createQueryHeap(device1, D3D12_QUERY_HEAP_TYPE_TIMESTAMP);
     ComPtr<ID3D12Resource> readBackBuffer0 = createReadbackBuffer(device0);
     ComPtr<ID3D12Resource> readBackBuffer1 = createReadbackBuffer(device1);
 
@@ -515,6 +533,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     UINT64 timestampFrequency0 = 0;
     directQueue0->GetTimestampFrequency(&timestampFrequency0);
+    UINT64 timestampFrequency1 = 0;
+    directQueue1->GetTimestampFrequency(&timestampFrequency1);
 
     bool running = true;
     float blue = 0.0f;
@@ -525,6 +545,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     CHECK_HR(list1->Close());
 
     std::vector<QueryData> queryData0;
+    std::vector<QueryData> queryData1;
 
     while (running)
     {
@@ -546,16 +567,37 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CHECK_HR(list1->Reset(commandAllocators1[frameIndex].Get(), nullptr));
 
             ID3D12Resource* tex1 = textures1[frameIndex].Get();
-            if (first)
             {
-                list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex1, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET));
+                D3D12_RESOURCE_STATES state = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_SOURCE;
+                list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex1, state, D3D12_RESOURCE_STATE_RENDER_TARGET));
             }
 
             blue = blue > 1.0f ? 0.0f : blue + 0.01f;
             float clearColor[4] = {0.0f, 0.2f, blue, 1.0f};
             CD3DX12_CPU_DESCRIPTOR_HANDLE textureRtv = CD3DX12_CPU_DESCRIPTOR_HANDLE(rtvHeap1->GetCPUDescriptorHandleForHeapStart(), frameIndex, rtvDescriptorSize1);
-
             list1->ClearRenderTargetView(textureRtv, clearColor, 0, nullptr);
+
+            list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex1, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE));
+
+            ID3D12Resource* sharedTex1 = sharedTextures1[frameIndex].Get();
+            {
+                D3D12_RESOURCE_STATES state = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_SOURCE;
+                list1->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(sharedTex1, state, D3D12_RESOURCE_STATE_COPY_DEST));
+            }
+
+            list1->EndQuery(queryHeap1.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+
+            list1->CopyResource(sharedTex1, tex1);
+
+            list1->EndQuery(queryHeap1.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+
+            list1->ResolveQueryData(
+                queryHeap1.Get(),
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                0, // Start index
+                2, // Number of queries
+                readBackBuffer1.Get(),
+                0); // Destination buffer offset
 
             CHECK_HR(list1->Close());
 
@@ -571,19 +613,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
             CHECK_HR(commandAllocators0[frameIndex]->Reset());
             CHECK_HR(list0->Reset(commandAllocators0[frameIndex].Get(), nullptr));
 
+            ID3D12Resource* sharedTex0 = sharedTextures0[frameIndex].Get();
+            list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(sharedTex0, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE));
+
             ID3D12Resource* backBuffer = backBuffers[frameIndex].Get();
-            ID3D12Resource* tex0 = textures0[frameIndex].Get();
-
-            if (first)
-            {
-                list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(tex0, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE));
-            }
-
             D3D12_RESOURCE_STATES backBufferState = first ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PRESENT;
             list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, backBufferState, D3D12_RESOURCE_STATE_COPY_DEST));
+
             list0->EndQuery(queryHeap0.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
 
-            list0->CopyResource(backBuffer, tex0);
+            list0->CopyResource(backBuffer, sharedTex0);
             list0->EndQuery(queryHeap0.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
 
             list0->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(backBuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT));
@@ -609,6 +648,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         frameFenceValues[frameIndex] = presentFenceValue;
 
         ++presentFenceValue;
+
+        {
+            // Copy the timestamp results after queue is completed
+            UINT64* mappedData = nullptr;
+            readBackBuffer1->Map(0, nullptr, reinterpret_cast<void**>(&mappedData));
+            QueryData queryData{};
+            queryData.start = mappedData[0];
+            queryData.end = mappedData[1];
+            readBackBuffer1->Unmap(0, nullptr);
+            queryData1.push_back(queryData);
+        }
 
         {
             // Copy the timestamp results after queue is completed
@@ -643,6 +693,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
 
+    double copyTimeTotal1 = 0.0;
+    for (const QueryData& q : queryData1)
+    {
+        double elapsedTimeInSeconds = static_cast<double>(q.end - q.start) / timestampFrequency1;
+        copyTimeTotal1 += elapsedTimeInSeconds;
+    }
+
     double copyTimeTotal0 = 0.0;
     for (const QueryData& q : queryData0)
     {
@@ -652,7 +709,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     std::ofstream myfile;
     myfile.open("dx12directout.txt");
-    myfile << "Average copy times: " << (copyTimeTotal0 / queryData0.size() * 1000.0) << "ms" << std::endl;
+    myfile << "Average copy times: " << std::endl
+           << "1: " << (copyTimeTotal1 / queryData1.size() * 1000.0) << "ms" << std::endl
+           << "0: " << (copyTimeTotal0 / queryData0.size() * 1000.0) << "ms" << std::endl;
     myfile.close();
     return 0;
 }
